@@ -1,0 +1,93 @@
+name: CRM dataset analysis
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: Temporary CRM analysis job identifier
+        required: true
+        type: string
+      api_base_url:
+        description: Public CRM API base URL
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out trusted analysis code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Fetch temporary dataset
+        env:
+          API_BASE_URL: ${{ inputs.api_base_url }}
+          JOB_ID: ${{ inputs.job_id }}
+          WORKFLOW_SECRET: ${{ secrets.ANALYSIS_WORKFLOW_SECRET }}
+        run: |
+          set -euo pipefail
+          if [ -z "$API_BASE_URL" ] || [ -z "$WORKFLOW_SECRET" ]; then
+            echo "The public API URL and workflow secret must be configured in workflow inputs and repository secrets."
+            exit 1
+          fi
+          curl --fail --silent --show-error \
+            -H "Authorization: Bearer $WORKFLOW_SECRET" \
+            "$API_BASE_URL/api/analysis/jobs/$JOB_ID/dataset" \
+            --output "$RUNNER_TEMP/dataset.csv"
+
+      - name: Run analysis without exposing dataset output in logs
+        env:
+          API_BASE_URL: ${{ inputs.api_base_url }}
+          JOB_ID: ${{ inputs.job_id }}
+          WORKFLOW_SECRET: ${{ secrets.ANALYSIS_WORKFLOW_SECRET }}
+        run: |
+          set -euo pipefail
+          OUTPUT_DIR="$RUNNER_TEMP/analysis-output"
+          mkdir -p "$OUTPUT_DIR"
+          set +e
+          timeout 120s python analysis.py \
+            --dataset "$RUNNER_TEMP/dataset.csv" \
+            --output-dir "$OUTPUT_DIR" \
+            > "$RUNNER_TEMP/report.json" 2> "$RUNNER_TEMP/analysis.stderr"
+          ANALYSIS_STATUS=$?
+          set -e
+
+          if [ "$ANALYSIS_STATUS" -ne 0 ]; then
+            printf '%s' '{"error":"Analysis script failed. Check the trusted script and retry."}' > "$RUNNER_TEMP/result.json"
+          elif [ ! -s "$RUNNER_TEMP/report.json" ] || [ "$(wc -c < "$RUNNER_TEMP/report.json")" -gt 2097152 ]; then
+            printf '%s' '{"error":"Analysis report was empty or exceeded the 2 MB result limit."}' > "$RUNNER_TEMP/result.json"
+          else
+            python - "$RUNNER_TEMP/report.json" "$RUNNER_TEMP/result.json" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          report = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          if not isinstance(report, dict):
+              raise SystemExit("Analysis report must be a JSON object")
+          report.pop("processed_dataset", None)
+          report.pop("processed_dataset_info", None)
+          report.pop("artifacts", None)
+          Path(sys.argv[2]).write_text(json.dumps({"report": report}), encoding="utf-8")
+          PY
+          fi
+
+          curl --fail --silent --show-error \
+            -H "Authorization: Bearer $WORKFLOW_SECRET" \
+            -H "Content-Type: application/json" \
+            --data-binary "@$RUNNER_TEMP/result.json" \
+            "$API_BASE_URL/api/analysis/jobs/$JOB_ID/result" \
+            --output /dev/null
+
+          if [ "$ANALYSIS_STATUS" -ne 0 ]; then exit "$ANALYSIS_STATUS"; fi
+
+
