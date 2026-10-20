@@ -62,10 +62,35 @@ def analyze_module(df, module="dataset"):
         {"label": "Duplicate rows", "value": int(df.duplicated().sum())},
         {"label": "Total columns", "value": int(len(df.columns))},
     ]
+    for numeric_column in df.columns:
+        if pd.api.types.is_numeric_dtype(df[numeric_column]):
+            values = df[numeric_column].dropna()
+            if not values.empty:
+                summary.extend([
+                    {"label": f"{numeric_column} total", "value": round(float(values.sum()), 2)},
+                    {"label": f"{numeric_column} average", "value": round(float(values.mean()), 2)},
+                ])
+
     charts = []
     if column is not None:
         summary.append({"label": f"{column} categories", "value": int(df[column].nunique(dropna=True))})
         charts.append(_category_chart(df, column))
+
+    # When both field types are available, compare the numeric measure across
+    # each category (for example, average Value for each Source).
+    numeric_columns = [
+        c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])
+    ]
+    if column is not None and numeric_columns:
+        numeric_column = numeric_columns[0]
+        grouped_averages = df.groupby(column, dropna=False)[numeric_column].mean().dropna()
+        if not grouped_averages.empty:
+            charts.append({
+                "title": f"Average {numeric_column} by {column}",
+                "type": "bar",
+                "labels": ["Missing" if pd.isna(label) else str(label) for label in grouped_averages.index],
+                "values": [round(float(value), 2) for value in grouped_averages.values],
+            })
     return {
         "title": f"{module_key.title()} dataset analysis",
         "summary": summary,
