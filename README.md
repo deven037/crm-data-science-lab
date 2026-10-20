@@ -8,7 +8,7 @@ A local Python analysis project for the Practice CRM Data Studio. The CRM bridge
 python analysis.py --dataset data/raw/example.csv --output-dir outputs
 ```
 
-The script writes one JSON report to stdout. Generated reports, processed datasets, charts, local IDE settings, and practice CRM exports are excluded from Git.
+The script writes one JSON report to stdout and saves a cleaned CSV under `outputs/processed/`. The report includes chart labels and values as JSON so the CRM UI can render a bar chart without needing a local image file. Generated reports, processed datasets, local IDE settings, and practice CRM exports are excluded from Git.
 
 Open this folder in PyCharm and edit `analysis.py` to build your own analysis. The Data Studio bridge runs locally on your computer; a GitHub copy does not run Python by itself.
 
@@ -21,6 +21,6 @@ Before hosted analysis is enabled, configure:
 - In the CRM API host (for example, Render): `ANALYSIS_GITHUB_REPOSITORY=deven037/crm-data-science-lab`, `ANALYSIS_GITHUB_REF=main`, `ANALYSIS_GITHUB_TOKEN` (a fine-grained token with Actions: write on this repository), `ANALYSIS_WORKFLOW_SECRET` (a random secret), and `PUBLIC_API_URL` (the public base URL of the CRM API).
 - In this repository's Actions settings: add `ANALYSIS_WORKFLOW_SECRET` with the same random secret. The CRM API base URL is passed in the workflow dispatch input.
 
-Keep all credentials out of the frontend and source control. The API limits datasets to 20 MB and 50,000 rows, limits each signed-in user to ten workflow requests per hour, and expires in-memory job data after ten minutes. Analysis runs for at most 120 seconds. Workflow output files and charts are temporary and are not returned; the report is returned to the signed-in CRM user.
+Keep all credentials out of the frontend and source control. The API limits datasets to 20 MB and 50,000 rows, limits each signed-in user to ten workflow requests per hour, and expires in-memory job data after ten minutes. Analysis runs for at most 120 seconds. The cleaned CSV is saved as a processed artifact; the JSON report, including chart data, is returned to the signed-in CRM user.
 
 
