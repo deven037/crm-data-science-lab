@@ -45,6 +45,8 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - name: Install analysis dependencies
+        run: python -m pip install -r requirements.txt
       - name: Mark saved-dataset job as running
         if: ${{ inputs.source_artifact_id != '' }}
         env:
@@ -101,7 +103,7 @@ jobs:
           ARTIFACT_DIR="$RUNNER_TEMP/processed-artifact"
           mkdir -p "$OUTPUT_DIR" "$ARTIFACT_DIR"
           set +e
-          timeout 120s python analysis.py --dataset "$INPUT_FILE" --output-dir "$OUTPUT_DIR" > "$RUNNER_TEMP/report.json" 2> "$RUNNER_TEMP/analysis.stderr"
+          timeout 120s python analysis.py --dataset "$INPUT_FILE" --output-dir "$OUTPUT_DIR" --module "$DATASET_CATEGORY" > "$RUNNER_TEMP/report.json" 2> "$RUNNER_TEMP/analysis.stderr"
           ANALYSIS_STATUS=$?
           set -e
           echo "status=$ANALYSIS_STATUS" >> "$GITHUB_OUTPUT"
