@@ -53,7 +53,8 @@ def main() -> None:
         writer.writeheader()
         writer.writerows(rows)
 
-    status_counts = Counter(row.get("status", "") or "Missing" for row in rows)
+    status_column = next((column for column in columns if column.strip().casefold() == "status"), None)
+    status_counts = Counter((row.get(status_column, "") or "Missing") for row in rows) if status_column else Counter()
     numeric_columns = []
     for column in columns:
         values = []
@@ -87,12 +88,7 @@ def main() -> None:
         "tables": [
             {"title": "Numeric column summary", "columns": ["Column", "Mean", "Non-missing"], "rows": [[item["label"], item["mean"], item["non_missing"]] for item in numeric_columns]}
         ],
-        "logs": [
-            f"Loaded {len(raw_rows)} rows from {args.dataset.name}.",
-            "Trimmed text cells, removed fully blank rows, and removed duplicate rows.",
-            f"Saved cleaned data to {processed_path.name}.",
-            "Edit analysis.py to implement your own analysis.",
-        ],
+        "logs": [f"Loaded {len(raw_rows)} rows from {args.dataset.name}.", "Trimmed text cells, removed fully blank rows, and removed duplicate rows.", f"Saved cleaned data to {processed_path.name}.", "Edit analysis.py to implement your own analysis."],
     }
     print(json.dumps(report, ensure_ascii=True))
 
