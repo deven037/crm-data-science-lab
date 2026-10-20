@@ -167,7 +167,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          mapfile -t artifacts < <(gh api --paginate --jq '.artifacts[] | select(.name | startswith("crm-processed-")) | "${.created_at}\t${.id}"' "repos/$GITHUB_REPOSITORY/actions/artifacts?per_page=100" | sort)
+          mapfile -t artifacts < <(gh api --paginate --jq '.artifacts[] | select(.name | startswith("crm-processed-")) | "\(.created_at)\t\(.id)"' "repos/$GITHUB_REPOSITORY/actions/artifacts?per_page=100" | sort)
           while [ "${#artifacts[@]}" -gt 10 ]; do
             IFS=$'\t' read -r _created artifact_id <<< "${artifacts[0]}"
             gh api --method DELETE "repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact_id"
