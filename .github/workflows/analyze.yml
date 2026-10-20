@@ -11,8 +11,27 @@ on:
         description: Public CRM API base URL
         required: true
         type: string
+      dataset_name:
+        description: Base name for the dataset and cleaned file
+        required: true
+        type: string
+      dataset_category:
+        description: CRM module category for this dataset
+        required: true
+        type: string
+      source_artifact_id:
+        description: Optional saved processed artifact ID to analyze again
+        required: false
+        type: string
+        default: ''
+      source_run_id:
+        description: Workflow run that created the selected saved artifact
+        required: false
+        type: string
+        default: ''
 
 permissions:
+  actions: write
   contents: read
 
 jobs:
@@ -22,72 +41,177 @@ jobs:
     steps:
       - name: Check out trusted analysis code
         uses: actions/checkout@v4
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-
-      - name: Fetch temporary dataset
+      - name: Mark saved-dataset job as running
+        if: ${{ inputs.source_artifact_id != '' }}
         env:
           API_BASE_URL: ${{ inputs.api_base_url }}
           JOB_ID: ${{ inputs.job_id }}
           WORKFLOW_SECRET: ${{ secrets.ANALYSIS_WORKFLOW_SECRET }}
         run: |
           set -euo pipefail
-          if [ -z "$API_BASE_URL" ] || [ -z "$WORKFLOW_SECRET" ]; then
-            echo "The public API URL and workflow secret must be configured in workflow inputs and repository secrets."
-            exit 1
-          fi
-          curl --fail --silent --show-error \
-            -H "Authorization: Bearer $WORKFLOW_SECRET" \
-            "$API_BASE_URL/api/analysis/jobs/$JOB_ID/dataset" \
-            --output "$RUNNER_TEMP/dataset.csv"
-
-      - name: Run analysis without exposing dataset output in logs
+          curl --fail --silent --show-error --request POST -H "Authorization: Bearer $WORKFLOW_SECRET" "$API_BASE_URL/api/analysis/jobs/$JOB_ID/start" --output /dev/null
+      - name: Download selected saved processed dataset
+        if: ${{ inputs.source_artifact_id != '' }}
+        uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ inputs.source_artifact_id }}
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.source_run_id }}
+          path: ${{ runner.temp }}/saved-dataset
+      - name: Prepare named dataset file
+        id: prepare_dataset
         env:
           API_BASE_URL: ${{ inputs.api_base_url }}
           JOB_ID: ${{ inputs.job_id }}
           WORKFLOW_SECRET: ${{ secrets.ANALYSIS_WORKFLOW_SECRET }}
+          DATASET_NAME: ${{ inputs.dataset_name }}
+          DATASET_CATEGORY: ${{ inputs.dataset_category }}
+          SOURCE_ARTIFACT_ID: ${{ inputs.source_artifact_id }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$DATASET_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$ ]]; then echo "Dataset name is invalid."; exit 1; fi
+          case "$DATASET_CATEGORY" in
+            leads|contacts|accounts|deals|products|campaigns|tickets|quotes|tasks|activities|notifications) ;;
+            *) echo "Dataset category is invalid."; exit 1 ;;
+          esac
+          INPUT_FILE="$RUNNER_TEMP/$DATASET_NAME.csv"
+          if [ -n "$SOURCE_ARTIFACT_ID" ]; then
+            SOURCE_FILE="$(find "$RUNNER_TEMP/saved-dataset" -type f -name '*-cleaned.csv' -print -quit)"
+            if [ -z "$SOURCE_FILE" ]; then echo "Saved artifact does not contain a cleaned CSV."; exit 1; fi
+            cp "$SOURCE_FILE" "$INPUT_FILE"
+          else
+            if [ -z "$WORKFLOW_SECRET" ]; then echo "Shared workflow secret is not configured."; exit 1; fi
+            curl --fail --silent --show-error -H "Authorization: Bearer $WORKFLOW_SECRET" "$API_BASE_URL/api/analysis/jobs/$JOB_ID/dataset" --output "$INPUT_FILE"
+          fi
+          echo "input_file=$INPUT_FILE" >> "$GITHUB_OUTPUT"
+      - name: Run analysis and prepare saved files
+        id: analysis
+        env:
+          INPUT_FILE: ${{ steps.prepare_dataset.outputs.input_file }}
+          DATASET_NAME: ${{ inputs.dataset_name }}
+          DATASET_CATEGORY: ${{ inputs.dataset_category }}
         run: |
           set -euo pipefail
           OUTPUT_DIR="$RUNNER_TEMP/analysis-output"
-          mkdir -p "$OUTPUT_DIR"
+          ARTIFACT_DIR="$RUNNER_TEMP/processed-artifact"
+          mkdir -p "$OUTPUT_DIR" "$ARTIFACT_DIR"
           set +e
-          timeout 120s python analysis.py \
-            --dataset "$RUNNER_TEMP/dataset.csv" \
-            --output-dir "$OUTPUT_DIR" \
-            > "$RUNNER_TEMP/report.json" 2> "$RUNNER_TEMP/analysis.stderr"
+          timeout 120s python analysis.py --dataset "$INPUT_FILE" --output-dir "$OUTPUT_DIR" > "$RUNNER_TEMP/report.json" 2> "$RUNNER_TEMP/analysis.stderr"
           ANALYSIS_STATUS=$?
           set -e
-
+          echo "status=$ANALYSIS_STATUS" >> "$GITHUB_OUTPUT"
           if [ "$ANALYSIS_STATUS" -ne 0 ]; then
             printf '%s' '{"error":"Analysis script failed. Check the trusted script and retry."}' > "$RUNNER_TEMP/result.json"
-          elif [ ! -s "$RUNNER_TEMP/report.json" ] || [ "$(wc -c < "$RUNNER_TEMP/report.json")" -gt 2097152 ]; then
-            printf '%s' '{"error":"Analysis report was empty or exceeded the 2 MB result limit."}' > "$RUNNER_TEMP/result.json"
+            exit 0
+          fi
+          if [ ! -s "$RUNNER_TEMP/report.json" ] || [ "$(wc -c < "$RUNNER_TEMP/report.json")" -gt 2097152 ]; then echo "Analysis report is empty or larger than 2 MB."; exit 1; fi
+          python - "$RUNNER_TEMP/report.json" "$OUTPUT_DIR" "$ARTIFACT_DIR" "$DATASET_NAME" "$DATASET_CATEGORY" <<'PY'
+          import csv
+          import json
+          import shutil
+          import sys
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          report_path, output_dir, artifact_dir, name, category = sys.argv[1:]
+          report = json.loads(Path(report_path).read_text(encoding="utf-8"))
+          relative = report.get("processed_dataset")
+          if not isinstance(relative, str) or not relative:
+              raise SystemExit("Analysis script did not return a processed CSV.")
+          output_root = Path(output_dir).resolve()
+          processed_root = (output_root / "processed").resolve()
+          processed_path = (output_root / relative).resolve()
+          if processed_root not in processed_path.parents or not processed_path.is_file() or processed_path.suffix.lower() != ".csv":
+              raise SystemExit("Processed CSV must be inside the analysis output processed folder.")
+          destination = Path(artifact_dir) / f"{name}-cleaned.csv"
+          shutil.copyfile(processed_path, destination)
+          with destination.open("r", newline="", encoding="utf-8-sig") as source:
+              reader = csv.reader(source)
+              fields = next(reader, [])
+              rows = sum(1 for _ in reader)
+          report["logs"] = report.get("logs", []) if isinstance(report.get("logs", []), list) else []
+          report["logs"].append(f"Saved cleaned dataset as {destination.name}.")
+          report.pop("processed_dataset", None)
+          report.pop("processed_dataset_info", None)
+          report.pop("artifacts", None)
+          Path(artifact_dir, "analysis-report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+          metadata = {
+              "name": name,
+              "category": category,
+              "file_name": destination.name,
+              "rows": rows,
+              "fields": fields,
+              "created_at": datetime.now(timezone.utc).isoformat(),
+          }
+          Path(artifact_dir, "dataset-metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+          PY
+      - name: Upload processed dataset and report
+        id: upload
+        if: steps.analysis.outputs.status == '0'
+        uses: actions/upload-artifact@v4
+        with:
+          name: crm-processed-${{ inputs.dataset_category }}-${{ inputs.dataset_name }}
+          path: ${{ runner.temp }}/processed-artifact/
+          if-no-files-found: error
+          retention-days: 90
+          compression-level: 6
+      - name: Keep only the 10 newest CRM processed datasets
+        id: prune
+        if: steps.analysis.outputs.status == '0' && steps.upload.outputs.artifact-id != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mapfile -t artifacts < <(gh api --paginate --jq '.artifacts[] | select(.name | startswith("crm-processed-")) | "${.created_at}\t${.id}"' "repos/$GITHUB_REPOSITORY/actions/artifacts?per_page=100" | sort)
+          while [ "${#artifacts[@]}" -gt 10 ]; do
+            IFS=$'\t' read -r _created artifact_id <<< "${artifacts[0]}"
+            gh api --method DELETE "repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact_id"
+            artifacts=("${artifacts[@]:1}")
+          done
+      - name: Return analysis report to CRM API
+        id: return_result
+        if: always() && steps.prepare_dataset.outcome == 'success'
+        env:
+          API_BASE_URL: ${{ inputs.api_base_url }}
+          JOB_ID: ${{ inputs.job_id }}
+          WORKFLOW_SECRET: ${{ secrets.ANALYSIS_WORKFLOW_SECRET }}
+          ANALYSIS_STATUS: ${{ steps.analysis.outputs.status }}
+          ARTIFACT_ID: ${{ steps.upload.outputs.artifact-id }}
+          PRUNE_STATUS: ${{ steps.prune.outcome }}
+        run: |
+          set -euo pipefail
+          if [ "$ANALYSIS_STATUS" != "0" ]; then
+            printf '%s' '{"error":"Analysis script failed. Check the workflow run for details."}' > "$RUNNER_TEMP/result.json"
+          elif [ -z "$ARTIFACT_ID" ] || [ "$PRUNE_STATUS" != "success" ]; then
+            printf '%s' '{"error":"Processed dataset artifact could not be saved and retained."}' > "$RUNNER_TEMP/result.json"
           else
-            python - "$RUNNER_TEMP/report.json" "$RUNNER_TEMP/result.json" <<'PY'
+            python - "$RUNNER_TEMP/report.json" "$RUNNER_TEMP/result.json" "$ARTIFACT_ID" <<'PY'
           import json
           import sys
           from pathlib import Path
 
           report = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-          if not isinstance(report, dict):
-              raise SystemExit("Analysis report must be a JSON object")
           report.pop("processed_dataset", None)
           report.pop("processed_dataset_info", None)
           report.pop("artifacts", None)
-          Path(sys.argv[2]).write_text(json.dumps({"report": report}), encoding="utf-8")
+          Path(sys.argv[2]).write_text(json.dumps({"report": report, "artifact_id": int(sys.argv[3])}), encoding="utf-8")
           PY
           fi
-
-          curl --fail --silent --show-error \
-            -H "Authorization: Bearer $WORKFLOW_SECRET" \
-            -H "Content-Type: application/json" \
-            --data-binary "@$RUNNER_TEMP/result.json" \
-            "$API_BASE_URL/api/analysis/jobs/$JOB_ID/result" \
-            --output /dev/null
-
-          if [ "$ANALYSIS_STATUS" -ne 0 ]; then exit "$ANALYSIS_STATUS"; fi
-
-
+          curl --fail --silent --show-error --request POST -H "Authorization: Bearer $WORKFLOW_SECRET" -H "Content-Type: application/json" --data-binary "@$RUNNER_TEMP/result.json" "$API_BASE_URL/api/analysis/jobs/$JOB_ID/result" --output /dev/null
+          if [ "$ANALYSIS_STATUS" != "0" ]; then exit "$ANALYSIS_STATUS"; fi
+          if [ -z "$ARTIFACT_ID" ] || [ "$PRUNE_STATUS" != "success" ]; then exit 1; fi
+      - name: Report workflow setup or download failure to CRM API
+        if: failure() && steps.return_result.outcome != 'success'
+        env:
+          API_BASE_URL: ${{ inputs.api_base_url }}
+          JOB_ID: ${{ inputs.job_id }}
+          WORKFLOW_SECRET: ${{ secrets.ANALYSIS_WORKFLOW_SECRET }}
+        run: |
+          set -euo pipefail
+          printf '%s' '{"error":"Workflow could not prepare or download the selected dataset. Check workflow configuration and retry."}' > "$RUNNER_TEMP/result-error.json"
+          curl --fail --silent --show-error --request POST -H "Authorization: Bearer $WORKFLOW_SECRET" -H "Content-Type: application/json" --data-binary "@$RUNNER_TEMP/result-error.json" "$API_BASE_URL/api/analysis/jobs/$JOB_ID/result" --output /dev/null
