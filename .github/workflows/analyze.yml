@@ -29,6 +29,11 @@ on:
         required: false
         type: string
         default: ''
+      save_processed_dataset:
+        description: Whether this run should save a new processed dataset artifact
+        required: false
+        type: string
+        default: 'true'
 
 permissions:
   actions: write
@@ -97,6 +102,7 @@ jobs:
           INPUT_FILE: ${{ steps.prepare_dataset.outputs.input_file }}
           DATASET_NAME: ${{ inputs.dataset_name }}
           DATASET_CATEGORY: ${{ inputs.dataset_category }}
+          SAVE_PROCESSED_DATASET: ${{ inputs.save_processed_dataset }}
         run: |
           set -euo pipefail
           OUTPUT_DIR="$RUNNER_TEMP/analysis-output"
@@ -112,7 +118,7 @@ jobs:
             exit 0
           fi
           if [ ! -s "$RUNNER_TEMP/report.json" ] || [ "$(wc -c < "$RUNNER_TEMP/report.json")" -gt 2097152 ]; then echo "Analysis report is empty or larger than 2 MB."; exit 1; fi
-          python - "$RUNNER_TEMP/report.json" "$OUTPUT_DIR" "$ARTIFACT_DIR" "$DATASET_NAME" "$DATASET_CATEGORY" <<'PY'
+          python - "$RUNNER_TEMP/report.json" "$OUTPUT_DIR" "$ARTIFACT_DIR" "$DATASET_NAME" "$DATASET_CATEGORY" "$SAVE_PROCESSED_DATASET" <<'PY'
           import csv
           import json
           import shutil
@@ -120,41 +126,49 @@ jobs:
           from datetime import datetime, timezone
           from pathlib import Path
 
-          report_path, output_dir, artifact_dir, name, category = sys.argv[1:]
-          report = json.loads(Path(report_path).read_text(encoding="utf-8"))
-          relative = report.get("processed_dataset")
-          if not isinstance(relative, str) or not relative:
-              raise SystemExit("Analysis script did not return a processed CSV.")
-          output_root = Path(output_dir).resolve()
-          processed_root = (output_root / "processed").resolve()
-          processed_path = (output_root / relative).resolve()
-          if processed_root not in processed_path.parents or not processed_path.is_file() or processed_path.suffix.lower() != ".csv":
-              raise SystemExit("Processed CSV must be inside the analysis output processed folder.")
-          destination = Path(artifact_dir) / f"{name}-cleaned.csv"
-          shutil.copyfile(processed_path, destination)
-          with destination.open("r", newline="", encoding="utf-8-sig") as source:
-              reader = csv.reader(source)
-              fields = next(reader, [])
-              rows = sum(1 for _ in reader)
+
+          report_path, output_dir, artifact_dir, name, category, save_processed_dataset = sys.argv[1:]
+          raw_report = json.loads(Path(report_path).read_text(encoding="utf-8"))
+          report = raw_report
           report["logs"] = report.get("logs", []) if isinstance(report.get("logs", []), list) else []
-          report["logs"].append(f"Saved cleaned dataset as {destination.name}.")
+          relative = raw_report.get("processed_dataset")
           report.pop("processed_dataset", None)
           report.pop("processed_dataset_info", None)
           report.pop("artifacts", None)
-          Path(artifact_dir, "analysis-report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
-          metadata = {
-              "name": name,
-              "category": category,
-              "file_name": destination.name,
-              "rows": rows,
-              "fields": fields,
-              "created_at": datetime.now(timezone.utc).isoformat(),
-          }
-          Path(artifact_dir, "dataset-metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+
+          if save_processed_dataset.lower() == "true":
+              if not isinstance(relative, str) or not relative:
+                  raise SystemExit("Analysis script did not return a processed CSV.")
+              output_root = Path(output_dir).resolve()
+              processed_root = (output_root / "processed").resolve()
+              processed_path = (output_root / relative).resolve()
+              if processed_root not in processed_path.parents or not processed_path.is_file() or processed_path.suffix.lower() != ".csv":
+                  raise SystemExit("Processed CSV must be inside the analysis output processed folder.")
+              destination = Path(artifact_dir) / f"{name}-cleaned.csv"
+              shutil.copyfile(processed_path, destination)
+              with destination.open("r", newline="", encoding="utf-8-sig") as source:
+                  reader = csv.reader(source)
+                  fields = next(reader, [])
+                  rows = sum(1 for _ in reader)
+              report["logs"].append(f"Saved cleaned dataset as {destination.name}.")
+              Path(artifact_dir, "analysis-report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+              metadata = {
+                  "name": name,
+                  "category": category,
+                  "file_name": destination.name,
+                  "rows": rows,
+                  "fields": fields,
+                  "created_at": datetime.now(timezone.utc).isoformat(),
+              }
+              Path(artifact_dir, "dataset-metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+          else:
+              report["logs"].append("Reused the selected saved processed dataset; no new dataset artifact was created.")
+
+          Path(report_path).write_text(json.dumps(report), encoding="utf-8")
           PY
       - name: Upload processed dataset and report
         id: upload
-        if: steps.analysis.outputs.status == '0'
+        if: steps.analysis.outputs.status == '0' && inputs.save_processed_dataset == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: crm-processed-${{ inputs.dataset_category }}-${{ inputs.dataset_name }}
@@ -164,7 +178,7 @@ jobs:
           compression-level: 6
       - name: Keep only the 10 newest CRM processed datasets
         id: prune
-        if: steps.analysis.outputs.status == '0' && steps.upload.outputs.artifact-id != ''
+        if: steps.analysis.outputs.status == '0' && inputs.save_processed_dataset == 'true' && steps.upload.outputs.artifact-id != ''
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -183,14 +197,23 @@ jobs:
           JOB_ID: ${{ inputs.job_id }}
           WORKFLOW_SECRET: ${{ secrets.ANALYSIS_WORKFLOW_SECRET }}
           ANALYSIS_STATUS: ${{ steps.analysis.outputs.status }}
-          ARTIFACT_ID: ${{ steps.upload.outputs.artifact-id }}
+          SAVE_PROCESSED_DATASET: ${{ inputs.save_processed_dataset }}
+          SOURCE_ARTIFACT_ID: ${{ inputs.source_artifact_id }}
+          UPLOADED_ARTIFACT_ID: ${{ steps.upload.outputs.artifact-id }}
           PRUNE_STATUS: ${{ steps.prune.outcome }}
         run: |
           set -euo pipefail
+          if [ "$SAVE_PROCESSED_DATASET" = "true" ]; then
+            ARTIFACT_ID="$UPLOADED_ARTIFACT_ID"
+          else
+            ARTIFACT_ID="$SOURCE_ARTIFACT_ID"
+          fi
           if [ "$ANALYSIS_STATUS" != "0" ]; then
             printf '%s' '{"error":"Analysis script failed. Check the workflow run for details."}' > "$RUNNER_TEMP/result.json"
-          elif [ -z "$ARTIFACT_ID" ] || [ "$PRUNE_STATUS" != "success" ]; then
+          elif [ "$SAVE_PROCESSED_DATASET" = "true" ] && { [ -z "$ARTIFACT_ID" ] || [ "$PRUNE_STATUS" != "success" ]; }; then
             printf '%s' '{"error":"Processed dataset artifact could not be saved and retained."}' > "$RUNNER_TEMP/result.json"
+          elif [ -z "$ARTIFACT_ID" ]; then
+            printf '%s' '{"error":"The selected saved dataset could not be identified for this rerun."}' > "$RUNNER_TEMP/result.json"
           else
             python - "$RUNNER_TEMP/report.json" "$RUNNER_TEMP/result.json" "$ARTIFACT_ID" <<'PY'
           import json
@@ -206,7 +229,8 @@ jobs:
           fi
           curl --fail --silent --show-error --request POST -H "Authorization: Bearer $WORKFLOW_SECRET" -H "Content-Type: application/json" --data-binary "@$RUNNER_TEMP/result.json" "$API_BASE_URL/api/analysis/jobs/$JOB_ID/result" --output /dev/null
           if [ "$ANALYSIS_STATUS" != "0" ]; then exit "$ANALYSIS_STATUS"; fi
-          if [ -z "$ARTIFACT_ID" ] || [ "$PRUNE_STATUS" != "success" ]; then exit 1; fi
+          if [ "$SAVE_PROCESSED_DATASET" = "true" ] && { [ -z "$ARTIFACT_ID" ] || [ "$PRUNE_STATUS" != "success" ]; }; then exit 1; fi
+          if [ -z "$ARTIFACT_ID" ]; then exit 1; fi
       - name: Report workflow setup or download failure to CRM API
         if: failure() && steps.return_result.outcome != 'success'
         env:
