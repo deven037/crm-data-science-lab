@@ -47,6 +47,37 @@ def _category_chart(df, column):
     }
 
 
+def numeric_statistics_table(df):
+    """Build a report table with mean, median, and population standard deviation.
+
+    Returns None when the dataset has no numeric columns with values.
+    """
+    rows = []
+    for column in df.columns:
+        if not pd.api.types.is_numeric_dtype(df[column]):
+            continue
+
+        values = df[column].dropna()
+        if values.empty:
+            continue
+
+        rows.append([
+            str(column),
+            round(float(values.mean()), 2),
+            round(float(values.median()), 2),
+            round(float(values.std(ddof=0)), 2),
+        ])
+
+    if not rows:
+        return None
+
+    return {
+        "title": "Numeric statistics",
+        "columns": ["Column", "Mean", "Median", "Standard deviation"],
+        "rows": rows,
+    }
+
+
 def analyze_module(df, module="dataset"):
     module_key = str(module or "dataset").strip().casefold()
     requested_column = MODULE_COLUMNS.get(module_key)

@@ -7,7 +7,7 @@ import json
 import re
 from pathlib import Path
 
-from methods.methods import analyze_module, clean_data, load_data
+from methods.methods import analyze_module, clean_data, load_data, numeric_statistics_table
 
 
 def main() -> None:
@@ -23,7 +23,18 @@ def main() -> None:
 
     cleaned = clean_data(df)
     df = cleaned["data"]
-    report["summary"].extend(cleaned["summary"])
+    report["tables"] = [{
+        "title": "Data cleaning summary",
+        "columns": ["Metric", "Value"],
+        "rows": [
+            [item["label"], item["value"]]
+            for item in cleaned["summary"]
+        ],
+    }]
+
+    statistics_table = numeric_statistics_table(df)
+    if statistics_table is not None:
+        report["tables"].append(statistics_table)
 
     processed_dir = args.output_dir / "processed"
     processed_dir.mkdir(parents=True, exist_ok=True)
